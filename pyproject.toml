@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llms-mirror"
+version = "0.1.0"
+description = "Mirror official docs (via llms.txt) as plain Markdown for LLM ingestion and RAG."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["llm", "rag", "docs", "llms.txt", "markdown", "scraper"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Documentation",
+]
+
+[project.urls]
+Homepage = "https://github.com/naelrudd/llms-mirror"
+Source = "https://github.com/naelrudd/llms-mirror"
+
+[project.scripts]
+llms-mirror = "llms_mirror:main"
+
+[tool.setuptools]
+packages = ["llms_mirror"]
