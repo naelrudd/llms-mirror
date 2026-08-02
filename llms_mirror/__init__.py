@@ -7,14 +7,17 @@ Pure stdlib. One pipeline: mirror a site, then (re)build single-file corpus
 
 import argparse
 import concurrent.futures
+import json
 import re
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 USER_AGENT = "llms-mirror/0.1.0 (+https://github.com/naelrudd/llms-mirror)"
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
@@ -25,6 +28,9 @@ SKIP_FILES = {"README.md", "INDEX.md", "llms.txt", "llms-full.txt", "missing.md"
 # ---------------------------------------------------------------- network
 
 def fetch_bytes(url: str, timeout: int = 30) -> bytes:
+    parts = urllib.parse.urlsplit(url)
+    path = urllib.parse.quote(parts.path, safe="/%:@&?=+")
+    url = urllib.parse.urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
@@ -52,16 +58,47 @@ def parse_links(text: str, base_url: str) -> list[str]:
     return links
 
 
-def doc_links(links: list[str]) -> list[str]:
+def doc_links(links: list[str], html: bool = False) -> list[str]:
     seen: set[str] = set()
     out = []
     for u in links:
-        if "#" in urllib.parse.urlsplit(u).fragment or not u.rstrip("/").endswith(".md"):
+        if "#" in urllib.parse.urlsplit(u).fragment:
+            continue
+        if not html and not u.rstrip("/").endswith(".md"):
             continue
         if u not in seen:
             seen.add(u)
             out.append(u)
     return out
+
+
+def json_links(text: str, root: str) -> list[str]:
+    """Extract doc URLs from a JSON doc-tree index (razorpay-style llms.txt)."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            path = node.get("path")
+            if isinstance(path, str) and path:
+                p = path.strip("/")
+                if p and "test-ssr" not in p:
+                    url = f"{root.rstrip('/')}/{p}/"
+                    if url not in seen:
+                        seen.add(url)
+                        urls.append(url)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(data)
+    return urls
 
 
 # ---------------------------------------------------------------- filesystem
@@ -84,10 +121,17 @@ def strip_frontmatter(text: str) -> str:
 
 
 def redact_keys(text: str) -> str:
-    return KEY_RE.sub(r"\1REPLACE_ME", text)
+    text = KEY_RE.sub(r"\1REPLACE_ME", text)
+    text = re.sub(r"\b(A[SK]IA)[0-9A-Z]{16}\b", r"\1_REPLACE_ME", text)
+    return text
 
 
 # ---------------------------------------------------------------- crawling
+
+RETRYABLE = {406, 408, 429, 500, 502, 503, 504}
+_rate_lock = threading.Lock()
+_last_request = 0.0
+
 
 def download_all(
     urls: list[str],
@@ -96,19 +140,61 @@ def download_all(
     timeout: int = 30,
     redact: bool = False,
     strip_fm: bool = False,
+    html: bool = False,
+    retries: int = 3,
+    delay: float = 0.0,
 ) -> list[str]:
     outdir.mkdir(parents=True, exist_ok=True)
     missing: list[str] = []
 
+    if html:
+        try:
+            from html2text import HTML2Text
+        except ImportError:
+            sys.exit("--html requires html2text: pip install llms-mirror[html]")
+
+    def to_markdown(raw_html: str) -> str:
+        conv = HTML2Text()
+        conv.body_width = 0
+        conv.ignore_images = True
+        conv.unicode_snob = True
+        conv.protect_links = True
+        return conv.handle(raw_html)
+
+    def rate_limit() -> None:
+        global _last_request
+        with _rate_lock:
+            wait = _last_request + delay - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            _last_request = time.monotonic()
+
     def one(url: str) -> tuple[str, bool]:
         rel = safe_path(url)
+        if html and rel.suffix.lower() not in (".md", ".markdown"):
+            rel = rel.with_suffix(".md")
         dest = outdir / rel
-        try:
-            text = fetch_text(url, timeout=timeout)
-        except urllib.error.HTTPError as e:
-            return (url, e.code != 404)
-        except Exception:
-            return (url, True)
+        if dest.exists() and dest.stat().st_size > 0:
+            return (url, True)  # resume: already downloaded
+        rate_limit()
+        for attempt in range(retries):
+            try:
+                text = fetch_text(url, timeout=timeout)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in RETRYABLE and attempt < retries - 1:
+                    time.sleep(1 + attempt * 2)
+                    continue
+                return (url, False)
+            except Exception:
+                if attempt < retries - 1:
+                    time.sleep(1 + attempt * 2)
+                    continue
+                return (url, False)
+        else:
+            return (url, False)
+        if html:
+            text = to_markdown(text)
         if strip_fm:
             text = strip_frontmatter(text)
         if redact:
@@ -244,18 +330,31 @@ def git_init(outdir: Path) -> None:
 
 # ---------------------------------------------------------------- CLI
 
+def json_root(llms_url: str) -> str:
+    parts = urllib.parse.urlsplit(llms_url)
+    dirname = parts.path.rstrip("/").rsplit("/", 1)[0]
+    return f"{parts.scheme}://{parts.netloc}{dirname}"
+
+
 def cmd_mirror(args: argparse.Namespace) -> int:
     outdir = Path(args.out)
-    print(f"Fetching {args.llms_url} ...")
-    try:
-        text = fetch_text(args.llms_url, timeout=args.timeout)
-    except Exception as e:
-        print(f"ERROR: cannot fetch {args.llms_url}: {e}", file=sys.stderr)
-        return 1
+    local_txt = outdir / "llms.txt"
+    if args.local_index and local_txt.exists():
+        text = local_txt.read_text(encoding="utf-8", errors="replace")
+        print(f"Using local index {local_txt} ({args.llms_url})")
+    else:
+        print(f"Fetching {args.llms_url} ...")
+        try:
+            text = fetch_text(args.llms_url, timeout=args.timeout)
+        except Exception as e:
+            print(f"ERROR: cannot fetch {args.llms_url}: {e}", file=sys.stderr)
+            return 1
 
-    links = doc_links(parse_links(text, args.llms_url))
+    links = doc_links(parse_links(text, args.llms_url), html=args.html)
     if not links:
-        print("ERROR: no .md links found in llms.txt", file=sys.stderr)
+        links = json_links(text, json_root(args.llms_url))
+    if not links:
+        print("ERROR: no doc links found in llms.txt", file=sys.stderr)
         return 1
     print(f"Found {len(links)} doc pages")
 
@@ -263,7 +362,17 @@ def cmd_mirror(args: argparse.Namespace) -> int:
     outdir.joinpath(".llms-mirror").write_text(args.llms_url + "\n", encoding="utf-8")
     outdir.joinpath("llms.txt").write_text(text, encoding="utf-8")
 
-    missing = download_all(links, outdir, args.workers, args.timeout, args.redact, args.strip_fm)
+    missing = download_all(
+        links,
+        outdir,
+        args.workers,
+        args.timeout,
+        args.redact,
+        args.strip_fm,
+        args.html,
+        args.retries,
+        args.delay,
+    )
     if missing:
         write_missing(outdir, missing)
         print(f"NOTE: {len(missing)} pages failed -> missing.md")
@@ -323,9 +432,13 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--workers", type=int, default=8, help="parallel downloads")
     m.add_argument("--timeout", type=int, default=30, help="per-request timeout seconds")
     m.add_argument("--redact", action="store_true", help="redact Stripe-style API keys in page bodies")
+    m.add_argument("--html", action="store_true", help="pages are HTML; convert to Markdown (needs html2text)")
     m.add_argument("--strip-fm", action="store_true", help="strip YAML frontmatter from pages")
     m.add_argument("--no-llms-full", dest="llmsfull", action="store_false", help="skip building llms-full.txt")
+    m.add_argument("--retries", type=int, default=3, help="retries per page on transient errors")
+    m.add_argument("--delay", type=float, default=0.0, help="min seconds between requests (rate limiting)")
     m.add_argument("--no-git", action="store_true", help="skip git init/commit")
+    m.add_argument("--local-index", action="store_true", help="reuse saved llms.txt instead of fetching it")
     m.set_defaults(func=cmd_mirror)
 
     f = sub.add_parser("full", help="regenerate llms-full.txt from a local corpus")

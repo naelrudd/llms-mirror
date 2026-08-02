@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llms-mirror"
-version = "0.1.0"
+version = "0.1.1"
 description = "Mirror official docs (via llms.txt) as plain Markdown for LLM ingestion and RAG."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,9 @@ Source = "https://github.com/naelrudd/llms-mirror"
 
 [project.scripts]
 llms-mirror = "llms_mirror:main"
+
+[project.optional-dependencies]
+html = ["html2text"]
 
 [tool.setuptools]
 packages = ["llms_mirror"]
