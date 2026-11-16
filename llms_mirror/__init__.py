@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 USER_AGENT = "llms-mirror/0.1.0 (+https://github.com/naelrudd/llms-mirror)"
 LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
@@ -99,6 +99,60 @@ def json_links(text: str, root: str) -> list[str]:
 
     walk(data)
     return urls
+
+
+def index_links(links: list[str], seen: set[str]) -> list[str]:
+    """Links that point at further llms indexes (.txt), not doc pages."""
+    out = []
+    for u in links:
+        path = urllib.parse.urlsplit(u).path
+        if not path.endswith(".txt"):
+            continue
+        if path.rsplit("/", 1)[-1] == "llms-full.txt":
+            continue  # single-file corpus, not an index
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def collect_doc_links(text: str, base_url: str, timeout: int = 30,
+                      max_depth: int = 4, max_indexes: int = 200) -> list[str]:
+    """All doc-page links reachable from an llms index.
+
+    Some sites (Razorpay since ~Nov 2026) publish an index of indexes:
+    llms.txt links only to sub-index .txt files, which link to further
+    sub-indexes and finally to .md pages ("follow each index recursively",
+    as Razorpay's llms.txt itself instructs). Follow .txt links
+    breadth-first, fetching each index once, and merge the .md links.
+    Flat indexes without .txt links behave exactly as before.
+    """
+    docs: list[str] = []
+    seen_docs: set[str] = set()
+    seen_idx: set[str] = {base_url}
+    texts = {base_url: text}
+    frontier = [base_url]
+    depth = 0
+    while frontier and depth <= max_depth and len(seen_idx) <= max_indexes:
+        next_frontier: list[str] = []
+        for idx_url in frontier:
+            idx_text = texts.pop(idx_url, None)
+            if idx_text is None:
+                print(f"Following sub-index {idx_url} ...")
+                try:
+                    idx_text = fetch_text(idx_url, timeout=timeout)
+                except Exception:
+                    continue
+            links = parse_links(idx_text, idx_url)
+            for u in doc_links(links):
+                if u not in seen_docs:
+                    seen_docs.add(u)
+                    docs.append(u)
+            if depth < max_depth:
+                next_frontier.extend(index_links(links, seen_idx))
+        frontier = next_frontier
+        depth += 1
+    return docs
 
 
 # ---------------------------------------------------------------- filesystem
@@ -350,7 +404,10 @@ def cmd_mirror(args: argparse.Namespace) -> int:
             print(f"ERROR: cannot fetch {args.llms_url}: {e}", file=sys.stderr)
             return 1
 
-    links = doc_links(parse_links(text, args.llms_url), html=args.html)
+    if args.html:
+        links = doc_links(parse_links(text, args.llms_url), html=True)
+    else:
+        links = collect_doc_links(text, args.llms_url, timeout=args.timeout)
     if not links:
         links = json_links(text, json_root(args.llms_url))
     if not links:
